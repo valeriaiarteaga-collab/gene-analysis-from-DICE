@@ -1,0 +1,358 @@
+#!/usr/bin/env python3 
+"""
+dice_cytoskeleton_compare.py
+
+Load DICE differential-expression CSV exports for multiple comparisons,
+extract a curated list of cytoskeleton / synapse genes, save a combined
+summary table, and generate publication-friendly plots.
+
+What this script assumes about the DICE "Compare cells (Bulk RNA Seq)" CSVs:
+- Columns include:
+    "Gene"
+    "Biotype"
+    "<GROUP_A>Mean Expression (TPM)"
+    "<GROUP_B>Mean Expression (TPM)"
+    "Log 2 Fold Change"
+    "Adjusted p-Value"
+    "Ensembl ID"
+- The exact GROUP_A / GROUP_B names vary by comparison.
+
+You can edit FILES and GENES below.
+
+Run:
+  python dice_cytoskeleton_compare.py
+"""
+
+import os
+import sys
+import math
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+# -----------------------------
+# User settings (EDIT ME)
+# -----------------------------
+BASE_DIR = r"C:\Users\valit\OneDrive - The Ohio State University\Research\T cells\Paper npj\DICE_database"
+
+FILES = {
+    # "TREG_MEM vs CD4_STIM": "TREG_MEM.Vs.CD4_STIM.csv",
+    # "TREG_MEM vs CD4_NAIVE": "TREG_MEM.Vs.CD4_NAIVE.csv",
+    "TREG_NAIVE vs CD4_STIM": "TREG_NAIVE.Vs.CD4_STIM.csv",
+    "TREG_NAIVE vs CD4_NAIVE": "TREG_NAIVE.Vs.CD4_NAIVE.csv",
+    "CD4_STIM vs CD4_NAIVE": "CD4_STIM.Vs.CD4_NAIVE.csv"
+}
+
+GENES = [
+    # Immune synapse / actin coupling
+    "WAS", "SWAP70",
+    # # Rho-family signaling
+    "RAC1", "DOCK2",
+    # ARP2/3 complex
+    # "ARPC1B",  "ARPC3",
+    "ARPC1A", "ARPC1B", "ARPC2", "ARPC3",
+    # Core actin machinery
+    # "ACTB", "CFL1",
+    # "ACTB",
+    # ERM family
+    "EZR", "RDX", "MSN",
+]
+
+OUT_SUMMARY_CSV = "DICE_cytoskeleton_summary_all_comparisons.csv"
+OUT_HEATMAP_PNG = "DICE_cytoskeleton_log2FC_heatmap.png"
+OUT_BAR_TPM_PNG = "DICE_cytoskeleton_TPM_bars_logscale.png"
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def _require_columns(df: pd.DataFrame, required):
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise KeyError(f"Missing expected columns: {missing}\nAvailable: {list(df.columns)}")
+
+def _find_tpm_columns(df: pd.DataFrame):
+    """
+    Find the two 'Mean Expression (TPM)' columns.
+    Returns (colA, colB) in the order they appear in the file.
+    """
+    tpm_cols = [c for c in df.columns if "Mean Expression (TPM)" in c]
+    if len(tpm_cols) < 2:
+        raise KeyError(
+            "Could not find TWO 'Mean Expression (TPM)' columns in the CSV.\n"
+            f"Found: {tpm_cols}\nAvailable: {list(df.columns)}"
+        )
+    return tpm_cols[0], tpm_cols[1]
+
+def _safe_log10_padj(p):
+    # For plotting significance; avoid -inf
+    try:
+        p = float(p)
+    except Exception:
+        return np.nan
+    if p <= 0:
+        return 300.0  # cap for display if p is 0
+    return -math.log10(p)
+
+def load_and_extract_one(comparison_label: str, filepath: str, genes: list[str]) -> pd.DataFrame:
+    df = pd.read_csv(filepath)
+    _require_columns(df, ["Gene", "Log 2 Fold Change", "Adjusted p-Value"])
+
+    tpmA_col, tpmB_col = _find_tpm_columns(df)
+
+    sub = df[df["Gene"].isin(genes)].copy()
+
+    # Keep order as GENES (not alphabetical)
+    order_map = {g: i for i, g in enumerate(genes)}
+    sub["__order"] = sub["Gene"].map(order_map)
+    sub = sub.sort_values("__order").drop(columns="__order")
+
+    # Build a standardized output table
+    out = pd.DataFrame({
+        "Comparison": comparison_label,
+        "Gene": sub["Gene"].values,
+        "Biotype": sub["Biotype"].values if "Biotype" in sub.columns else "",
+        "TPM_A": sub[tpmA_col].values,
+        "TPM_B": sub[tpmB_col].values,
+        "TPM_A_colname": tpmA_col,
+        "TPM_B_colname": tpmB_col,
+        "log2FC": sub["Log 2 Fold Change"].values,
+        "adj_p": sub["Adjusted p-Value"].values,
+        "minus_log10_adj_p": [ _safe_log10_padj(x) for x in sub["Adjusted p-Value"].values ],
+        "Ensembl ID": sub["Ensembl ID"].values if "Ensembl ID" in sub.columns else "",
+    })
+
+    return out
+
+def ensure_files_exist(base_dir: str, files_dict: dict) -> dict:
+    resolved = {}
+    missing = []
+    for label, fname in files_dict.items():
+        path = os.path.join(base_dir, fname)
+        if not os.path.exists(path):
+            missing.append(path)
+        resolved[label] = path
+    if missing:
+        msg = "ERROR: The following CSV file(s) were not found:\n" + "\n".join(missing)
+        raise FileNotFoundError(msg)
+    return resolved
+
+def plot_heatmap_log2fc(summary: pd.DataFrame, genes: list[str], outpath: str):
+    """
+    Heatmap-like plot without seaborn (pure matplotlib), showing log2FC per gene per comparison.
+    """
+    comparisons = list(summary["Comparison"].unique())
+
+    # Pivot to matrix [genes x comparisons]
+    mat = np.full((len(genes), len(comparisons)), np.nan, dtype=float)
+    for i, g in enumerate(genes):
+        for j, comp in enumerate(comparisons):
+            rows = summary[(summary["Gene"] == g) & (summary["Comparison"] == comp)]
+            if len(rows) == 1:
+                mat[i, j] = float(rows["log2FC"].iloc[0])
+
+    vmax = np.nanmax(np.abs(mat)) if np.isfinite(mat).any() else 1.0
+
+    fig, ax = plt.subplots(figsize=(1.2 * len(comparisons) + 4, 0.4 * len(genes) + 3))
+    im = ax.imshow(mat, aspect="auto", vmin=-vmax, vmax=vmax)
+
+    ax.set_xticks(np.arange(len(comparisons)))
+    ax.set_xticklabels(comparisons, rotation=30, ha="right")
+    ax.set_yticks(np.arange(len(genes)))
+    ax.set_yticklabels(genes)
+
+    ax.set_title("DICE Bulk RNA-seq: log2 fold-change (Treg vs comparator)")
+    cbar = fig.colorbar(im, ax=ax)
+    cbar.set_label("log2FC")
+
+    # Annotate each cell with numeric value (optional but helpful)
+    for i in range(len(genes)):
+        for j in range(len(comparisons)):
+            if np.isfinite(mat[i, j]):
+                ax.text(j, i, f"{mat[i,j]:.2f}", ha="center", va="center", fontsize=8)
+
+    fig.tight_layout()
+    fig.savefig(outpath, dpi=300)
+    # Show in Spyder plot viewer
+    plt.show()
+    plt.close(fig)
+
+def plot_tpm_bars(summary: pd.DataFrame, comparison_to_plot: str, genes: list[str], outpath: str):
+    """
+    Side-by-side barplot of TPM_A vs TPM_B for one selected comparison.
+    Uses log y-scale to handle TPM dynamic range.
+    """
+    sub = summary[summary["Comparison"] == comparison_to_plot].copy()
+
+    # enforce gene order
+    order_map = {g: i for i, g in enumerate(genes)}
+    sub["__order"] = sub["Gene"].map(order_map)
+    sub = sub.sort_values("__order").drop(columns="__order")
+
+    if sub.empty:
+        raise ValueError(f"No rows found for comparison '{comparison_to_plot}'")
+
+    x = np.arange(len(sub))
+    width = 0.38
+
+    fig, ax = plt.subplots(figsize=(max(10, 0.6 * len(sub) + 4), 5))
+
+    ax.bar(x - width/2, sub["TPM_A"].astype(float), width, label=_shorten_label(sub["TPM_A_colname"].iloc[0]))
+    ax.bar(x + width/2, sub["TPM_B"].astype(float), width, label=_shorten_label(sub["TPM_B_colname"].iloc[0]))
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(sub["Gene"].tolist(), rotation=45, ha="right")
+    ax.set_ylabel("Mean expression (TPM)")
+    ax.set_yscale("log")
+    ax.set_title(f"DICE Bulk RNA-seq TPM: {comparison_to_plot}")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(outpath, dpi=300)
+    # Show in Spyder plot viewer
+    plt.show()
+    plt.close(fig)
+
+def _shorten_label(colname: str) -> str:
+    # Make legend cleaner: strip trailing "Mean Expression (TPM)"
+    return colname.replace("Mean Expression (TPM)", "").strip()
+
+# -----------------------------
+# UPDATED scatter plot (ONLY function changed)
+# -----------------------------
+def plot_scatter_log2fc_vs_significance(summary: pd.DataFrame, genes: list[str], outpath: str):
+    """
+    Scatter plot of log2FC vs -log10(adj p-value) for GENES,
+    faceted by comparison (one panel per comparison).
+
+    Fixes label overlap by:
+      - using arrow callouts
+      - staggering label y-offsets deterministically by gene index
+    """
+    comparisons = list(summary["Comparison"].unique())
+    n = len(comparisons)
+
+    fig, axes = plt.subplots(
+        nrows=n,
+        ncols=1,
+        figsize=(6, 3.2 * n),
+        sharex=True,
+        sharey=True
+    )
+
+    if n == 1:
+        axes = [axes]
+
+    sig_y = -math.log10(0.05)
+
+    # Staggering parameters (tweak if you want)
+    base_dx = 0.18
+    base_dy = 0.18
+    step_dy = 0.10  # vertical stagger amount per gene
+
+    for ax, comp in zip(axes, comparisons):
+        sub = summary[
+            (summary["Comparison"] == comp) &
+            (summary["Gene"].isin(genes))
+        ].copy()
+
+        # Keep order as GENES, so stagger pattern is stable
+        order_map = {g: i for i, g in enumerate(genes)}
+        sub["__order"] = sub["Gene"].map(order_map)
+        sub = sub.sort_values("__order").drop(columns="__order")
+
+        ax.scatter(sub["log2FC"], sub["minus_log10_adj_p"], s=70)
+
+        # annotate with arrows + staggering
+        for idx, (_, r) in enumerate(sub.iterrows()):
+            dy = base_dy + step_dy * (idx % 4)  # cycle through 4 heights
+            dx = base_dx
+
+            ax.annotate(
+                r["Gene"],
+                xy=(r["log2FC"], r["minus_log10_adj_p"]),
+                xytext=(r["log2FC"] + dx, r["minus_log10_adj_p"] + dy),
+                arrowprops=dict(arrowstyle="-", lw=0.8),
+                fontsize=10
+            )
+
+        # significance + center lines
+        ax.axhline(sig_y, linestyle="--", linewidth=1, color="gray")
+        ax.axvline(0, linestyle=":", linewidth=1, color="gray")
+
+        # label the significance line
+        ax.text(
+            0.98, sig_y,
+            "adj p = 0.05",
+            transform=ax.get_yaxis_transform(),  # x in axes coords, y in data coords
+            ha="right",
+            va="bottom",
+            fontsize=9,
+            color="gray"
+        )
+
+        ax.set_title(comp)
+        ax.set_ylabel("-log10(adj p)")
+
+    axes[-1].set_xlabel("log2 fold change")
+
+    fig.suptitle("DICE cytoskeleton genes: fold-change vs significance", y=0.98)
+    fig.tight_layout()
+    fig.savefig(outpath, dpi=300)
+
+    # Show in Spyder
+    plt.show()
+    plt.close(fig)
+
+def main():
+    # Resolve and validate file paths
+    resolved = ensure_files_exist(BASE_DIR, FILES)
+
+    # Extract
+    all_parts = []
+    for comp_label, path in resolved.items():
+        part = load_and_extract_one(comp_label, path, GENES)
+
+        # Warn if any requested genes are missing in this comparison
+        found = set(part["Gene"].tolist())
+        missing = [g for g in GENES if g not in found]
+        if missing:
+            print(f"[warn] {comp_label}: missing genes in table: {missing}")
+
+        all_parts.append(part)
+
+    summary = pd.concat(all_parts, ignore_index=True)
+
+    # Save combined summary
+    out_csv_path = os.path.join(BASE_DIR, OUT_SUMMARY_CSV)
+    summary.to_csv(out_csv_path, index=False)
+    print(f"[ok] Wrote combined summary: {out_csv_path}")
+
+    # Heatmap of log2FC across all comparisons
+    out_heatmap_path = os.path.join(BASE_DIR, OUT_HEATMAP_PNG)
+    plot_heatmap_log2fc(summary, GENES, out_heatmap_path)
+    print(f"[ok] Wrote heatmap: {out_heatmap_path}")
+
+    # TPM bar plot for one comparison (pick the first)
+    first_comp = list(FILES.keys())[0]
+    out_tpm_path = os.path.join(BASE_DIR, OUT_BAR_TPM_PNG)
+    plot_tpm_bars(summary, first_comp, GENES, out_tpm_path)
+    print(f"[ok] Wrote TPM bar plot for '{first_comp}': {out_tpm_path}")
+
+    # NEW: scatter plot for significance vs log2FC (with overlap-fixed labels)
+    out_scatter_path = os.path.join(BASE_DIR, "DICE_cytoskeleton_scatter_log2FC_vs_significance.png")
+    plot_scatter_log2fc_vs_significance(summary, GENES, out_scatter_path)
+    print(f"[ok] Wrote scatter plot: {out_scatter_path}")
+
+    # Print a quick console summary for convenience
+    print("\nQuick view (log2FC, adj_p):")
+    view = summary[["Comparison", "Gene", "log2FC", "adj_p"]].copy()
+    # Keep gene order in display
+    view["__order"] = view["Gene"].map({g:i for i,g in enumerate(GENES)})
+    view = view.sort_values(["Comparison", "__order"]).drop(columns="__order")
+    print(view.to_string(index=False))
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        print(f"\n[error] {e}", file=sys.stderr)
+        raise
