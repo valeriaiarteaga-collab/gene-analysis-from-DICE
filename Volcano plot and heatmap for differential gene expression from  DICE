@@ -29,6 +29,7 @@ import math
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+from adjustText import adjust_text
 
 # -----------------------------
 # User settings (EDIT ME)
@@ -223,9 +224,7 @@ def plot_scatter_log2fc_vs_significance(summary: pd.DataFrame, genes: list[str],
     Scatter plot of log2FC vs -log10(adj p-value) for GENES,
     faceted by comparison (one panel per comparison).
 
-    Fixes label overlap by:
-      - using arrow callouts
-      - staggering label y-offsets deterministically by gene index
+    Uses adjustText to avoid label overlap (best solution for dense clusters).
     """
     comparisons = list(summary["Comparison"].unique())
     n = len(comparisons)
@@ -243,46 +242,49 @@ def plot_scatter_log2fc_vs_significance(summary: pd.DataFrame, genes: list[str],
 
     sig_y = -math.log10(0.05)
 
-    # Staggering parameters (tweak if you want)
-    base_dx = 0.18
-    base_dy = 0.18
-    step_dy = 0.10  # vertical stagger amount per gene
-
     for ax, comp in zip(axes, comparisons):
         sub = summary[
             (summary["Comparison"] == comp) &
             (summary["Gene"].isin(genes))
         ].copy()
 
-        # Keep order as GENES, so stagger pattern is stable
+        # Keep order as GENES
         order_map = {g: i for i, g in enumerate(genes)}
         sub["__order"] = sub["Gene"].map(order_map)
         sub = sub.sort_values("__order").drop(columns="__order")
 
         ax.scatter(sub["log2FC"], sub["minus_log10_adj_p"], s=70)
 
-        # annotate with arrows + staggering
-        for idx, (_, r) in enumerate(sub.iterrows()):
-            dy = base_dy + step_dy * (idx % 4)  # cycle through 4 heights
-            dx = base_dx
-
-            ax.annotate(
-                r["Gene"],
-                xy=(r["log2FC"], r["minus_log10_adj_p"]),
-                xytext=(r["log2FC"] + dx, r["minus_log10_adj_p"] + dy),
-                arrowprops=dict(arrowstyle="-", lw=0.8),
-                fontsize=10
+        # Initial text placement: start at the point location
+        texts = []
+        for _, r in sub.iterrows():
+            texts.append(
+                ax.text(
+                    r["log2FC"],
+                    r["minus_log10_adj_p"],
+                    r["Gene"],
+                    fontsize=10
+                )
             )
 
-        # significance + center lines
+        # Push labels around to avoid overlap, add arrows back to points
+        adjust_text(
+            texts,
+            ax=ax,
+            expand_points=(1.2, 1.3),
+            expand_text=(1.2, 1.3),
+            force_points=0.2,
+            force_text=0.2,
+            arrowprops=dict(arrowstyle="-", lw=0.8, color="gray")
+        )
+
         ax.axhline(sig_y, linestyle="--", linewidth=1, color="gray")
         ax.axvline(0, linestyle=":", linewidth=1, color="gray")
 
-        # label the significance line
         ax.text(
             0.98, sig_y,
             "adj p = 0.05",
-            transform=ax.get_yaxis_transform(),  # x in axes coords, y in data coords
+            transform=ax.get_yaxis_transform(),
             ha="right",
             va="bottom",
             fontsize=9,
@@ -298,7 +300,6 @@ def plot_scatter_log2fc_vs_significance(summary: pd.DataFrame, genes: list[str],
     fig.tight_layout()
     fig.savefig(outpath, dpi=300)
 
-    # Show in Spyder
     plt.show()
     plt.close(fig)
 
